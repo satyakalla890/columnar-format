@@ -34,13 +34,14 @@ _unpack_u64 = lambda b: struct.unpack('<Q', b)[0]
 _unpack_i32 = lambda b: struct.unpack('<i', b)[0]
 _unpack_f64 = lambda b: struct.unpack('<d', b)[0]
 
+def safe_decompress(comp: bytes, meta: dict, col_name: str):
+    try:
+        return zlib.decompress(comp)
+    except Exception as e:
+        raise RuntimeError(f"Failed to decompress column '{col_name}' (offset={meta.get('offset')}, comp_size={meta.get('comp_size')}) - underlying error: {e}") from e
+
 
 def read_header(f) -> Dict[str, Any]:
-    """
-    Reads and returns header information from the file object f (open in 'rb').
-    Returns dict: {version, endianness, header_size, schema(dict), metas(list)}
-    Each meta: {'offset', 'comp_size', 'uncomp_size', 'has_nulls'}
-    """
     f.seek(0)
     magic = f.read(4)
     if magic != MAGIC:
@@ -50,8 +51,16 @@ def read_header(f) -> Dict[str, Any]:
     endianness = _unpack_u8(f.read(1))
     header_size = _unpack_u32(f.read(4))
 
+    # Validate version/endianness
+    if version != 1:
+        raise ValueError(f"Unsupported file version: {version}. Expected version 1.")
+    if endianness != 1:
+        raise ValueError(f"Unsupported endianness: {endianness}. Only little-endian (1) is supported.")
+
     # read schema length + schema JSON
     schema_len = _unpack_u32(f.read(4))
+    if schema_len <= 0 or schema_len > 10_000_000:
+        raise ValueError(f"Suspicious schema length: {schema_len}")
     schema_json = f.read(schema_len)
     try:
         schema = json.loads(schema_json.decode('utf-8'))
@@ -59,34 +68,29 @@ def read_header(f) -> Dict[str, Any]:
         raise ValueError("Failed to parse schema JSON") from e
 
     num_cols = len(schema.get('columns', []))
+    if num_cols == 0:
+        # allow zero columns but warn
+        # we'll still return the header
+        pass
 
     metas = []
     for _ in range(num_cols):
-        offset = _unpack_u64(f.read(8))
-        comp_size = _unpack_u64(f.read(8))
-        uncomp_size = _unpack_u64(f.read(8))
-        has_nulls = _unpack_u8(f.read(1))
-        metas.append({
-            'offset': offset,
-            'comp_size': comp_size,
-            'uncomp_size': uncomp_size,
-            'has_nulls': bool(has_nulls)
-        })
+        # guard reading to avoid partially corrupted file causing exceptions
+        off_bytes = f.read(8)
+        comp_bytes = f.read(8)
+        uncomp_bytes = f.read(8)
+        has_nulls_b = f.read(1)
+        if len(off_bytes) < 8 or len(comp_bytes) < 8 or len(uncomp_bytes) < 8 or len(has_nulls_b) < 1:
+            raise ValueError("Unexpected end of file while reading column metadata")
+        offset = _unpack_u64(off_bytes)
+        comp_size = _unpack_u64(comp_bytes)
+        uncomp_size = _unpack_u64(uncomp_bytes)
+        has_nulls = _unpack_u8(has_nulls_b)
+        metas.append({'offset': offset, 'comp_size': comp_size, 'uncomp_size': uncomp_size, 'has_nulls': bool(has_nulls)})
 
-    return {
-        'version': version,
-        'endianness': endianness,
-        'header_size': header_size,
-        'schema': schema,
-        'metas': metas
-    }
-
+    return {'version': version, 'endianness': endianness, 'header_size': header_size, 'schema': schema, 'metas': metas}
 
 def decode_column_payload(payload: bytes, dtype: str, num_rows: int, has_nulls: bool) -> List[Any]:
-    """
-    Decode the uncompressed payload bytes for one column.
-    Returns a list of values of length num_rows (None for NULLs).
-    """
     buf = io.BytesIO(payload)
 
     # Payload starts with DataType (1) and HasNulls (1) bytes per spec
@@ -159,10 +163,6 @@ def decode_column_payload(payload: bytes, dtype: str, num_rows: int, has_nulls: 
 
 
 def read_columns(colf_path: str, columns: List[str]) -> Dict[str, List[Any]]:
-    """
-    Selectively read the requested columns from the .colf file.
-    Returns a dict mapping column_name -> list_of_values.
-    """
     with open(colf_path, 'rb') as f:
         header = read_header(f)
         schema = header['schema']
@@ -193,9 +193,6 @@ def read_columns(colf_path: str, columns: List[str]) -> Dict[str, List[Any]]:
 
 
 def read_all(colf_path: str) -> List[Dict[str, Any]]:
-    """
-    Read entire file and reconstruct rows (list of dicts).
-    """
     with open(colf_path, 'rb') as f:
         header = read_header(f)
         schema = header['schema']
@@ -210,7 +207,7 @@ def read_all(colf_path: str) -> List[Dict[str, Any]]:
                 continue
             f.seek(meta['offset'])
             comp = f.read(meta['comp_size'])
-            payload = zlib.decompress(comp)
+            payload = safe_decompress(comp, meta, col['name'])
             vals = decode_column_payload(payload, col['type'], num_rows, meta['has_nulls'])
             col_arrays[col['name']] = vals
 
@@ -223,10 +220,6 @@ def read_all(colf_path: str) -> List[Dict[str, Any]]:
             rows.append(row)
         return rows
 
-
-# -------------------------
-# CLI: use argparse with subcommands
-# -------------------------
 def cli():
     parser = argparse.ArgumentParser(description="Reader for custom columnar format (.colf)")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -237,15 +230,27 @@ def cli():
 
     p2 = sub.add_parser("read_columns", help="Read selected columns (prints CSV to stdout)")
     p2.add_argument("input", help="input .colf file")
-    p2.add_argument("cols", help="comma-separated column names (e.g. name,salary)")
+    p2.add_argument("cols", help="comma-separated column names")
 
     args = parser.parse_args()
-
     if args.cmd == "custom_to_csv":
         rows = read_all(args.input)
+
+        # If zero rows → write only header
         if not rows:
+            with open(args.input, "rb") as f:
+                header = read_header(f)
+                columns = [c['name'] for c in header['schema']['columns']]
+
+            with open(args.output, "w", newline='', encoding='utf-8') as out:
+                writer = csv.writer(out)
+                writer.writerow(columns)
+
             print("No rows to write")
+            print(f"Wrote empty CSV to {args.output}")
             return
+
+        # Normal non-empty file
         cols = list(rows[0].keys())
         with open(args.output, "w", newline='', encoding='utf-8') as out:
             writer = csv.DictWriter(out, fieldnames=cols)
@@ -253,18 +258,21 @@ def cli():
             for r in rows:
                 out_row = {k: ("" if r[k] is None else str(r[k])) for k in cols}
                 writer.writerow(out_row)
-        print(f"Wrote CSV to {args.output}")
 
+        print(f"Wrote CSV to {args.output}")
+        return
     elif args.cmd == "read_columns":
         cols = [c.strip() for c in args.cols.split(",") if c.strip()]
         result = read_columns(args.input, cols)
-        # print CSV to stdout
+
         writer = csv.writer(sys.stdout)
         writer.writerow(cols)
         num_rows = len(next(iter(result.values()))) if result else 0
+
         for i in range(num_rows):
             row = [("" if result[c][i] is None else result[c][i]) for c in cols]
             writer.writerow(row)
+
 
 
 if __name__ == '__main__':
