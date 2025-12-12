@@ -31,7 +31,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 ### Install Dependencies
-pip install faker pytest
+pip install -r requirements.txt
 
 ### Convert CSV → Columnar Format
 python writer.py csv_to_custom sample_small.csv out.colf
